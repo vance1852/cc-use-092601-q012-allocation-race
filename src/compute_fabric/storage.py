@@ -128,6 +128,8 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     route_id TEXT NOT NULL REFERENCES routes(route_id),
     service_date TEXT NOT NULL,
     input_sha256 TEXT NOT NULL,
+    nominations_sha256 TEXT NOT NULL DEFAULT '',
+    capacity_json TEXT NOT NULL DEFAULT '',
     available_capacity TEXT NOT NULL,
     result_json TEXT NOT NULL,
     created_by TEXT NOT NULL REFERENCES supply_users(user_id),
@@ -209,6 +211,21 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+# 针对既有数据库的幂等列迁移：审计需要还原分配时的预约集合摘要与容量快照。
+_ALLOCATION_RUN_MIGRATIONS = {
+    "nominations_sha256": "ALTER TABLE allocation_runs ADD COLUMN nominations_sha256 TEXT NOT NULL DEFAULT ''",
+    "capacity_json": "ALTER TABLE allocation_runs ADD COLUMN capacity_json TEXT NOT NULL DEFAULT ''",
+}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(allocation_runs)")}
+    for name, statement in _ALLOCATION_RUN_MIGRATIONS.items():
+        if name not in columns:
+            connection.execute(statement)
 
 
 @contextmanager

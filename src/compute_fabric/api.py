@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sqlite3
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -75,6 +76,11 @@ class JsonApplication:
                 return Response(201, self.service.submit_nomination(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["service_date"]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "routes" and parts[2] == "allocations":
+                service_date = query.get("service_date", [""])[0]
+                if not service_date:
+                    raise ValidationFailed("缺少 service_date")
+                return Response(200, self.service.allocation_audit(actor, parts[1], service_date))
             if method == "POST" and path == "/transfers":
                 return Response(201, self.service.dispatch_transfer(actor, payload["transfer_id"], payload["nomination_id"], payload["lot_id"], int(payload["expected_revision"])))
             if method == "POST" and path == "/scenarios":
@@ -88,6 +94,8 @@ class JsonApplication:
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except SupplyError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+        except sqlite3.Error:
+            return Response(500, {"error": {"code": "storage_error", "message": "存储服务暂不可用，请稍后重试"}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
 

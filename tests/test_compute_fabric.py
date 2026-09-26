@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from compute_fabric.api import JsonApplication
 from compute_fabric.clock import FrozenClock
 from compute_fabric.errors import Conflict, Forbidden
 from compute_fabric.planning import AllocationRequest, PricePoint, allocate_capacity, latest_streak
 from compute_fabric.service import SupplyService
+from compute_fabric.storage import connect
 from compute_fabric.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
 
 
@@ -129,6 +133,166 @@ class SupplyServiceTests(unittest.TestCase):
         response = app.handle("GET", "/quotes/summary/PEAK_VALLEY", {"X-Actor-Id": "plan"})
         self.assertEqual(response.status, 404)
         self.assertEqual(response.body["error"]["code"], "not_found")
+
+
+class AllocationConcurrencyTests(unittest.TestCase):
+    """使用文件型 SQLite 与真实线程，确定性覆盖分配的两种竞争结局。"""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.path = Path(self.directory.name) / "fabric.sqlite3"
+        self.connection = connect(self.path)
+        self.clock = FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc))
+        self.service = SupplyService(self.connection, self.clock)
+        for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
+            self.service.create_user(user_id, user_id, role)
+        self.service.create_facility("plan", {"facility_id": "cluster-a", "name": "北部数据中心", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_gpu_hours": "500000"})
+        self.service.create_facility("plan", {"facility_id": "pool-b", "name": "东部推理池", "kind": "inference-pool", "timezone": "Asia/Shanghai", "capacity_gpu_hours": "800000"})
+        self.service.create_route("plan", {"route_id": "fabric-a-b", "origin_id": "cluster-a", "destination_id": "pool-b", "product": "gpu-h100", "daily_capacity": "100000", "loss_basis_points": 25, "transit_hours": 36})
+        for number, requested, priority in ((1, "40000", 10), (2, "30000", 20)):
+            self.service.submit_nomination("dispatch", {"nomination_id": f"nom-{number}", "route_id": "fabric-a-b", "shipper_id": f"shipper-{number}", "service_date": "2026-09-25", "requested_gpu_hours": requested, "priority": priority, "idempotency_key": f"key-{number}"})
+
+    def tearDown(self) -> None:
+        self.connection.close()
+        self.directory.cleanup()
+
+    def _thread_service(self) -> SupplyService:
+        return SupplyService(connect(self.path), self.clock)
+
+    def test_same_input_race_returns_one_business_result(self) -> None:
+        barrier = threading.Barrier(2)
+        results: list[dict[str, object]] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            connection = connect(self.path)
+            try:
+                service = SupplyService(connection, self.clock)
+                barrier.wait(timeout=10)
+                results.append(service.allocate("dispatch", "fabric-a-b", "2026-09-25"))
+            except BaseException as exc:  # noqa: BLE001 - 断言中报告任何底层异常
+                errors.append(exc)
+            finally:
+                connection.close()
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual(len({result["allocation_id"] for result in results}), 1)
+        self.assertEqual(results[0]["allocations"], results[1]["allocations"])
+        self.assertEqual(sorted(bool(result["replayed"]) for result in results), [False, True])
+        run_count = self.connection.execute(
+            "SELECT count(*) FROM allocation_runs WHERE route_id='fabric-a-b' AND service_date='2026-09-25'"
+        ).fetchone()[0]
+        self.assertEqual(run_count, 1)
+        states = self.connection.execute(
+            "SELECT state,revision FROM nominations WHERE route_id='fabric-a-b' AND service_date='2026-09-25' "
+            "ORDER BY nomination_id"
+        ).fetchall()
+        self.assertEqual([(row["state"], row["revision"]) for row in states], [("allocated", 2), ("allocated", 2)])
+
+    def test_changed_nomination_set_conflicts_without_partial_state(self) -> None:
+        first = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        self.assertFalse(first["replayed"])
+
+        inserted = threading.Event()
+
+        def submit_extra() -> None:
+            connection = connect(self.path)
+            try:
+                service = SupplyService(connection, self.clock)
+                service.submit_nomination("dispatch", {"nomination_id": "nom-3", "route_id": "fabric-a-b", "shipper_id": "shipper-3", "service_date": "2026-09-25", "requested_gpu_hours": "20000", "priority": 30, "idempotency_key": "key-3"})
+                inserted.set()
+            finally:
+                connection.close()
+
+        conflict: list[BaseException] = []
+
+        def retry_allocate() -> None:
+            inserted.wait(timeout=10)
+            connection = connect(self.path)
+            try:
+                service = SupplyService(connection, self.clock)
+                service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+            except BaseException as exc:  # noqa: BLE001
+                conflict.append(exc)
+            finally:
+                connection.close()
+
+        submitter = threading.Thread(target=submit_extra)
+        retrying = threading.Thread(target=retry_allocate)
+        submitter.start()
+        retrying.start()
+        submitter.join(timeout=30)
+        retrying.join(timeout=30)
+
+        self.assertEqual(len(conflict), 1)
+        self.assertIsInstance(conflict[0], Conflict)
+        message = str(conflict[0])
+        self.assertNotIn("sqlite", message.lower())
+        self.assertNotIn("UNIQUE", message)
+        extra = self.connection.execute("SELECT * FROM nominations WHERE nomination_id='nom-3'").fetchone()
+        self.assertEqual(extra["state"], "submitted")
+        self.assertEqual(extra["revision"], 1)
+        self.assertEqual(extra["allocated_gpu_hours"], "0")
+        run_count = self.connection.execute(
+            "SELECT count(*) FROM allocation_runs WHERE route_id='fabric-a-b' AND service_date='2026-09-25'"
+        ).fetchone()[0]
+        self.assertEqual(run_count, 1)
+
+        app = JsonApplication(self.service)
+        response = app.handle(
+            "POST",
+            "/routes/fabric-a-b/allocate",
+            {"X-Actor-Id": "dispatch", "Content-Type": "application/json"},
+            b'{"service_date":"2026-09-25"}',
+        )
+        self.assertEqual(response.status, 409)
+        self.assertEqual(response.body["error"]["code"], "conflict")
+        self.assertNotIn("sqlite", response.body["error"]["message"].lower())
+
+    def test_maintenance_version_change_turns_replay_into_conflict(self) -> None:
+        first = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        repeated = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        self.assertTrue(repeated["replayed"])
+        self.assertEqual(repeated["allocation_id"], first["allocation_id"])
+        self.service.announce_outage("risk", "fabric-a-b", "2026-09-25T00:00:00Z", "2026-09-25T23:59:59Z", "50", "临时检修")
+        with self.assertRaises(Conflict):
+            self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+
+    def test_audit_endpoint_restores_snapshot_summary_and_commit_version(self) -> None:
+        allocation = self.service.allocate("dispatch", "fabric-a-b", "2026-09-25")
+        app = JsonApplication(self.service)
+        response = app.handle("GET", f"/audit/allocations/{allocation['allocation_id']}", {"X-Actor-Id": "audit"})
+        self.assertEqual(response.status, 200)
+        body = response.body
+        self.assertEqual(body["allocation_id"], allocation["allocation_id"])
+        self.assertEqual(body["route_id"], "fabric-a-b")
+        self.assertEqual(body["service_date"], "2026-09-25")
+        self.assertEqual(body["available_capacity"], "100000.000")
+        self.assertEqual(body["capacity_snapshot"]["daily_capacity"], "100000")
+        self.assertEqual(body["capacity_snapshot"]["outages"], [])
+        self.assertEqual(body["nominations"]["count"], 2)
+        self.assertEqual(body["nominations"]["ids"], ["nom-1", "nom-2"])
+        self.assertEqual(len(body["nominations"]["sha256"]), 64)
+        self.assertEqual(len(body["context_sha256"]), 64)
+        self.assertEqual(len(body["input_sha256"]), 64)
+        self.assertEqual(body["allocations"], allocation["allocations"])
+        stored = self.connection.execute(
+            "SELECT input_sha256 FROM allocation_runs WHERE allocation_id=?",
+            (allocation["allocation_id"],),
+        ).fetchone()
+        self.assertEqual(body["input_sha256"], stored["input_sha256"])
+
+        forbidden = app.handle("GET", f"/audit/allocations/{allocation['allocation_id']}", {"X-Actor-Id": "dispatch"})
+        self.assertEqual(forbidden.status, 403)
+        missing = app.handle("GET", "/audit/allocations/9999", {"X-Actor-Id": "audit"})
+        self.assertEqual(missing.status, 404)
 
 
 if __name__ == "__main__":

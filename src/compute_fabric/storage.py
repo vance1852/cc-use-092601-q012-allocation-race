@@ -135,6 +135,9 @@ CREATE TABLE IF NOT EXISTS allocation_runs (
     UNIQUE(route_id, service_date, input_sha256)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_allocation_runs_schedule
+ON allocation_runs(route_id, service_date);
+
 CREATE TABLE IF NOT EXISTS transfers (
     transfer_id TEXT PRIMARY KEY,
     nomination_id TEXT NOT NULL UNIQUE REFERENCES nominations(nomination_id),
@@ -220,7 +223,11 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.rollback()
         raise
     else:
-        connection.commit()
+        try:
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
 
 
 def row_dict(row: sqlite3.Row | None) -> dict[str, object] | None:
